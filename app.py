@@ -1,5 +1,5 @@
 # modal_app.py
-import os, signal, subprocess
+import os, signal, subprocess, json
 from datetime import datetime
 import modal
 from modal import Image, Volume, gpu
@@ -79,9 +79,10 @@ eng.shutdown()
         code = proc.wait()
     return f"{log_path} (exit={code})"
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cachejjjjjjjj": kc})
+@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cachejjjjjjjj": kc, "/logs": log})
 def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID, max_new_tokens: int = 64, attention_backend: str = "") -> dict:
     import os, time, torch, sglang as sgl
+    _ensure()
     if attention_backend:
         os.environ["SGLANG_ATTENTION_BACKEND"] = attention_backend
     t0 = time.time()
@@ -90,7 +91,19 @@ def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID,
     out = eng.generate([prompt], {"max_new_tokens": max_new_tokens, "temperature": 0.0})
     torch.cuda.synchronize(); t2 = time.time()
     eng.shutdown()
-    return {"load_s": round(t1 - t0, 3), "infer_s": round(t2 - t1, 3), "preview": out[0]["text"][:200]}
+    result = {"timestamp": datetime.utcnow().isoformat() + "Z",
+              "model_id": model_id,
+              "prompt": prompt,
+              "max_new_tokens": max_new_tokens,
+              "load_s": round(t1 - t0, 3),
+              "infer_s": round(t2 - t1, 3),
+              "text": out[0]["text"]}
+    log_path = f"/logs/sglang/infer_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"[inference_test] Saved result to {log_path}")
+    print(f"[preview] {result['text'][:200]}")
+    return {"file_path": log_path, "load_s": result["load_s"], "infer_s": result["infer_s"], "preview": result["text"][:200]}
 
 @app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cachejjjjjjjj": kc, "/logs": log}, timeout=24*60*60, max_containers=1)
 @modal.web_server(port=8000)
