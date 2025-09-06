@@ -6,6 +6,7 @@ from modal import Image, Volume, gpu
 
 app = modal.App("sglang-official-dev")
 
+
 # volumes: models, jit/compile caches, logs
 hf  = Volume.from_name("hf-cache", create_if_missing=True)
 kc  = Volume.from_name("kernels-cache", create_if_missing=True)
@@ -15,43 +16,60 @@ MODEL_ID = os.environ.get("SGLANG_MODEL_ID", "openai/gpt-oss-20b")
 GPU_KIND = os.environ.get("MODAL_GPU", "L4").upper()
 GPU      = {"L4": "L4", "L40S": "L40S", "A100": "A100-40GB", "H100": "H100"}.get(GPU_KIND, "L4")
 
+
+def set_vars():
+    os.environ["HF_HOME"] = "/hf"
+    os.environ["TRANSFORMERS_CACHE"] = "/hf/transformers"
+    os.environ["HF_DATASETS_CACHE"] = "/hf/datasets"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/kernels/persist/inductor"
+    os.environ["TRITON_CACHE_DIR"] = "/kernels/persist/triton"
+    os.environ["CUDA_CACHE_PATH"] = "/kernels/persist/nv"
+    os.environ["XDG_CACHE_HOME"] = "/kernels/persist/xdg"
+    os.environ["FLASHINFER_CACHE_DIR"] = "/kernels/persist/flashinfer"
+    os.environ["OMP_NUM_THREADS"] = "8"
+    os.environ["MKL_NUM_THREADS"] = "8"
+    os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM", "0")
+
+
+# Build image from base and install local sglang
 image = (
-    Image.from_registry("docker.io/lmsysorg/sglang:dev")
-    .env({
-        # HuggingFace downloads
-        "HF_HOME": "/hf",
-        "TRANSFORMERS_CACHE": "/hf/transformers",
-        "HF_DATASETS_CACHE": "/hf/datasets",
-        # Compiler / JIT caches
-        "TORCHINDUCTOR_CACHE_DIR": "/mnt/cachejjjjjjjjjjjjjjjjjjjj/inductor",
-        "TRITON_CACHE_DIR": "/mnt/cachejjjj/triton",
-        "CUDA_CACHE_PATH": "/mnt/cachejjjj/nv",
-        "XDG_CACHE_HOME": "/mnt/cachejjjj/xdg",
-        # Optional: FlashInfer cache (XDG covers it; set explicit path if you want)
-        "FLASHINFER_CACHE_DIR": "/mnt/cachejjjj/flashinfer",
-        # Stable CPU threads for repeatable timings
-        "OMP_NUM_THREADS": "8",
-        "MKL_NUM_THREADS": "8",
-        # Don’t surprise-JIT deepgemm unless you ask for it
-        "SGL_ENABLE_JIT_DEEPGEMM": os.environ.get("SGL_ENABLE_JIT_DEEPGEMM", "0"),
-    })
+    Image.from_registry("python:3.10-slim")
+    .apt_install("git", "wget", "curl", "build-essential")
+    .uv_pip_install("torch", "huggingface_hub")
+    .add_local_dir(local_path="sglang", remote_path="/root/sglang")
 )
 
 def _ensure():
     os.makedirs("/logs/sglang", exist_ok=True)
     os.makedirs("/logs/sglang/crash_dumps", exist_ok=True)
     os.makedirs("/logs/sglang/traces", exist_ok=True)
+    # Ensure kernel cache directories exist (persisted via the /kernels volume)
+    os.makedirs("/kernels/persist/inductor", exist_ok=True)
+    os.makedirs("/kernels/persist/triton", exist_ok=True)
+    os.makedirs("/kernels/persist/nv", exist_ok=True)
+    os.makedirs("/kernels/persist/xdg", exist_ok=True)
+    os.makedirs("/kernels/persist/flashinfer", exist_ok=True)
 
 @app.function(image=image, gpu=None, volumes={"/hf": hf})
 def prewarm(model_id: str = MODEL_ID) -> str:
+    # Install local sglang before running prewarm
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/python"], check=True)
+    # Optional: install auxiliary packages if they exist (kernels/router)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-kernel"], check=False)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-router"], check=False)
     from huggingface_hub import snapshot_download
     tgt = f"/hf/models/{model_id.replace('/', '__')}"
     snapshot_download(repo_id=model_id, local_dir=tgt)
     return tgt
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cache": kc, "/logs": log}, timeout=30*60)
+@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/kernels": kc, "/logs": log}, timeout=30*60)
 def build_kernels() -> str:
     """Optional one-shot prebuild to prime DeepGEMM/Triton/Inductor caches."""
+    # Install local sglang before building kernels
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/python"], check=True)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-kernel"], check=False)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-router"], check=False)
+    
     _ensure()
     log_path = f"/logs/sglang/build_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.log"
     code = 0
@@ -79,9 +97,15 @@ eng.shutdown()
         code = proc.wait()
     return f"{log_path} (exit={code})"
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cachejjjjjjjj": kc, "/logs": log})
+@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/kernels": kc, "/logs": log})
 def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID, max_new_tokens: int = 64, attention_backend: str = "") -> dict:
-    import os, time, torch, sglang as sgl
+    import os, time, torch
+    # Install local sglang before running inference
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/python"], check=True)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-kernel"], check=False)
+    subprocess.run(["uv", "pip", "install", "-e", "/root/sglang/sgl-router"], check=False)
+    import sglang as sgl
+    
     _ensure()
     if attention_backend:
         os.environ["SGLANG_ATTENTION_BACKEND"] = attention_backend
@@ -94,53 +118,78 @@ def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID,
     result = {"timestamp": datetime.utcnow().isoformat() + "Z",
               "model_id": model_id,
               "prompt": prompt,
-              "max_new_tokens": max_new_tokens,
-              "load_s": round(t1 - t0, 3),
-              "infer_s": round(t2 - t1, 3),
-              "text": out[0]["text"]}
-    log_path = f"/logs/sglang/infer_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"[inference_test] Saved result to {log_path}")
-    print(f"[preview] {result['text'][:200]}")
-    return {"file_path": log_path, "load_s": result["load_s"], "infer_s": result["infer_s"], "preview": result["text"][:200]}
+              "completion": out[0]["text"],
+              "load_time_sec": t1-t0,
+              "gen_time_sec": t2-t1,
+              "gen_tokens": max_new_tokens,
+              "backend": os.environ.get("SGLANG_ATTENTION_BACKEND", "")}
+    with open(f"/logs/sglang/inference_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json", "w") as f:
+        json.dump(result, f)
+    return result
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/mnt/cachejjjjjjjj": kc, "/logs": log}, timeout=24*60*60, max_containers=1)
-@modal.web_server(port=8000)
-def serve():
-    """Run sglang.launch_server from the official image with persisted caches."""
+@app.function(image=image, gpu=None, volumes={"/kernels": kc})
+def test_vol(filename: str = "hello.txt", content: str = "hello world") -> dict:
+    """Write a file to the mounted `/kernels` volume and persist it.
+
+    Returns basic verification metadata.
+    """
+    path = f"/kernels/{filename}"
+    existed_before = os.path.exists(path)
+    with open(path, "w") as f:
+        f.write(content)
+    # Persist changes to the volume before exit
+    kc.commit()
+    existed_after = os.path.exists(path)
+    with open(path, "r") as f:
+        new_content = f.read()
+    return {
+        "path": path,
+        "existed_before": existed_before,
+        "existed_after": existed_after,
+        "new_content": new_content,
+    }
+
+@app.function(image=image, gpu=None, volumes={"/kernels": kc, "/logs": log})
+def volume_probe(marker: str = "hello", path: str = "/kernels/.probe") -> dict:
+    """Write/read a marker under /kernels to verify volume mount and persistence.
+
+    Returns metadata about previous existence, contents, and a listing of /kernels.
+    """
     _ensure()
-    args = ["python", "-m", "sglang.launch_server",
-            "--model-path", MODEL_ID, "--host", "0.0.0.0", "--port", "8000",
-            "--download-dir", "/hf",
-            "--crash-dump-folder", "/logs/sglang/crash_dumps"]
-    if os.environ.get("SGLANG_ATTENTION_BACKEND"):
-        args += ["--attention-backend", os.environ["SGLANG_ATTENTION_BACKEND"]]
-    if os.environ.get("SGLANG_SAMPLING_BACKEND"):
-        args += ["--sampling-backend", os.environ["SGLANG_SAMPLING_BACKEND"]]
-    if os.environ.get("SGLANG_API_KEY"):
-        args += ["--api-key", os.environ["SGLANG_API_KEY"]]
+    existed_before = os.path.exists(path)
+    prev_content = None
+    if existed_before:
+        try:
+            with open(path, "r") as f:
+                prev_content = f.read()
+        except Exception as e:
+            prev_content = f"<read_error: {e}>"
 
-    run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    log_path = f"/logs/sglang/server_{run_id}.log"
-    with open(log_path, "a", buffering=1) as f:
-        f.write(f"CMD: {' '.join(args)}\n")
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    ts = datetime.utcnow().isoformat() + "Z"
+    with open(path, "w") as f:
+        f.write(f"{ts} {marker}")
 
-        def _term(sig, frm):
-            try: proc.terminate()
-            except: pass
-        signal.signal(signal.SIGTERM, _term)
+    existed_after = os.path.exists(path)
+    with open(path, "r") as f:
+        new_content = f.read()
 
-        for line in proc.stdout or []:
-            print(line, end="")
-            try: f.write(line)
-            except: pass
-
-@app.function()
-def endpoint_url() -> str:
     try:
-        fn = modal.Function.from_name(app.name, "serve")
-        return fn.get_web_url() or ""
-    except Exception:
-        return ""
+        listing = os.listdir("/kernels")
+    except Exception as e:
+        listing = [f"<list_error: {e}>"]
+
+    result = {
+        "timestamp": ts,
+        "path": path,
+        "existed_before": existed_before,
+        "prev_content": prev_content,
+        "existed_after": existed_after,
+        "new_content": new_content,
+        "kernels_listing": listing,
+    }
+    with open(f"/logs/sglang/volume_probe_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json", "w") as f:
+        json.dump(result, f)
+    # Ensure changes are persisted to the mounted volumes before exit
+    kc.commit()
+    log.commit()
+    return result
