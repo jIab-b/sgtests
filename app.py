@@ -1,5 +1,5 @@
 # modal_app.py
-import os, signal, subprocess, json
+import os, signal, subprocess, json, shutil
 from datetime import datetime
 import modal
 from modal import Image, Volume, gpu
@@ -64,6 +64,10 @@ def set_build_vars():
     """
     # Compiler cache for C/C++/CUDA
     os.environ["CCACHE_DIR"] = "/kernels/build/ccache"
+    # Avoid link/clone ops on Modal volumes; use copy-based temp in /tmp
+    os.environ["CCACHE_HARDLINK"] = "0"
+    os.environ["CCACHE_FILE_CLONE"] = "0"
+    os.environ["CCACHE_TEMPDIR"] = "/tmp/ccache-tmp"
     os.environ["CC"] = "ccache gcc"
     os.environ["CXX"] = "ccache g++"
 
@@ -73,11 +77,12 @@ def set_build_vars():
     os.environ["CMAKE_C_COMPILER_LAUNCHER"] = "ccache"
     os.environ["CMAKE_CXX_COMPILER_LAUNCHER"] = "ccache"
     os.environ["CMAKE_CUDA_COMPILER_LAUNCHER"] = "ccache"
-    # Ensure cache dirs exist
+    # Ensure cache/temp dirs exist
     for d in [
         os.environ.get("CCACHE_DIR", "/kernels/build/ccache"),
         os.environ.get("CARGO_HOME", "/kernels/build/cargo"),
         os.environ.get("CARGO_TARGET_DIR", "/kernels/build/cargo/target"),
+        os.environ.get("CCACHE_TEMPDIR", "/tmp/ccache-tmp"),
     ]:
         os.makedirs(d, exist_ok=True)
 
@@ -211,4 +216,94 @@ def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID,
               "backend": os.environ.get("SGLANG_ATTENTION_BACKEND", "")}
     with open(f"/logs/sglang/inference_ws_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json", "w") as f:
         json.dump(result, f)
+    return result
+
+
+@app.function(image=image, gpu=None, volumes={"/kernels": kc})
+def test_cache() -> dict:
+    """Smoke-test that compiler caches write to /kernels (prints to console only).
+
+    Steps:
+    1) Set build env (ccache + CMake launchers)
+    2) Zero ccache stats; record config
+    3) Build a tiny C project twice with CMake+Ninja so the 2nd build yields ccache hits
+    4) Summarize stats and confirm files exist under /kernels/build/ccache
+    """
+    # 1) Build env
+    set_build_vars()
+
+    # Local helpers
+    env = {**os.environ}
+
+    def run(cmd: list[str]) -> tuple[int, str]:
+        print("$ " + " ".join(cmd))
+        proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out
+
+    # 2) Inspect env and ccache config; zero stats
+    cc_dir = os.environ.get("CCACHE_DIR", "")
+    run(["bash", "-lc", "echo CCACHE_DIR=$CCACHE_DIR; echo CMAKE_C_COMPILER_LAUNCHER=$CMAKE_C_COMPILER_LAUNCHER; echo CMAKE_CUDA_COMPILER_LAUNCHER=$CMAKE_CUDA_COMPILER_LAUNCHER"])
+    run(["bash", "-lc", "ls -ld /kernels /kernels/build /kernels/build/ccache || true"]) 
+    run(["ccache", "-z"])  # zero stats
+    _, cc_cfg = run(["ccache", "--show-config"])
+    _, stats0 = run(["ccache", "-s"])  # before
+
+    # 3) Tiny C project built twice
+    work = "/tmp/ccache_smoke"
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        with open(os.path.join(work, "CMakeLists.txt"), "w") as f:
+            f.write(
+                "\n".join([
+                    "cmake_minimum_required(VERSION 3.22)",
+                    "project(ccache_smoke LANGUAGES C)",
+                    "set(CMAKE_VERBOSE_MAKEFILE ON)",
+                    "add_executable(hello main.c)",
+                ])
+            )
+        with open(os.path.join(work, "main.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(){ puts("hi"); return 0; }\n')
+
+        build1 = os.path.join(work, "build1")
+        build2 = os.path.join(work, "build2")
+        for bdir in (build1, build2):
+            os.makedirs(bdir, exist_ok=True)
+
+        # First build (expect cache miss)
+        run(["cmake", "-S", work, "-B", build1, "-G", "Ninja"])
+        run(["cmake", "--build", build1, "-v"])
+        _, stats1 = run(["ccache", "-s"])  # after first build
+
+        # Second build in a fresh build dir (expect cache hits)
+        run(["cmake", "-S", work, "-B", build2, "-G", "Ninja"])
+        run(["cmake", "--build", build2, "-v"])
+        _, stats2 = run(["ccache", "-s"])  # after second build
+    finally:
+        # leave the build dirs; they are temporary, but keeping them is fine
+        pass
+
+    # 4) Summarize filesystem evidence under /kernels
+    cache_file_count = 0
+    sample = []
+    for root, _, files in os.walk(cc_dir or "/kernels/build/ccache"):
+        for name in files:
+            cache_file_count += 1
+            if len(sample) < 10:
+                sample.append(os.path.join(root, name))
+
+    result = {
+        "ccache_dir": cc_dir,
+        "ccache_config": cc_cfg,
+        "stats_before": stats0,
+        "stats_after_first": stats1,
+        "stats_after_second": stats2,
+        "cache_file_count": cache_file_count,
+        "cache_file_sample": sample,
+    }
     return result
