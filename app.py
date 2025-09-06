@@ -1,6 +1,7 @@
 # modal_app.py
 import os, signal, subprocess, json, shutil
 from datetime import datetime
+from typing import Optional, List
 import modal
 from modal import Image, Volume, gpu
 
@@ -16,7 +17,7 @@ workspace = Volume.from_name("workspace", create_if_missing=True)
  
 
 image = (
-    Image.from_registry("pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel")
+    Image.from_registry("pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel")
     .run_commands(
         # Prepare to add NVIDIA CUDA APT repo (for Nsight CLI tools)
         "apt-get update && apt-get install -y curl ca-certificates gnupg",
@@ -32,8 +33,8 @@ image = (
         # Kernel build deps
         "libnuma-dev",            # required by MSCCl++ and NUMA-aware components
         "rdma-core", "libibverbs-dev",  # optional RDMA/IB verbs support (non-fatal if unused)
-        # Nsight CLI tools from CUDA 12.9 repo
-        "cuda-nsight-systems-12-9", "cuda-nsight-compute-12-9",
+        # Nsight CLI tools matching CUDA 12.8
+        "cuda-nsight-systems-12-8", "cuda-nsight-compute-12-8",
     )
     .uv_pip_install(
         # Ensure uv is present for runtime `python3 -m uv ...`
@@ -64,12 +65,14 @@ def set_build_vars():
     """
     # Compiler cache for C/C++/CUDA
     os.environ["CCACHE_DIR"] = "/kernels/build/ccache"
-    # Avoid link/clone ops on Modal volumes; use copy-based temp in /tmp
-    os.environ["CCACHE_HARDLINK"] = "0"
-    os.environ["CCACHE_FILE_CLONE"] = "0"
+    # Avoid hardlink/clone on Modal volumes; use supported boolean flags
+    # Newer ccache rejects numeric booleans like "0"/"1".
+    os.environ["CCACHE_NOHARDLINK"] = "true"
+    os.environ["CCACHE_FILE_CLONE"] = "false"
     os.environ["CCACHE_TEMPDIR"] = "/tmp/ccache-tmp"
-    os.environ["CC"] = "ccache gcc"
-    os.environ["CXX"] = "ccache g++"
+    # Let CMake use ccache via compiler launchers; keep CC/CXX as real compilers
+    os.environ["CC"] = "gcc"
+    os.environ["CXX"] = "g++"
 
     os.environ["CARGO_HOME"] = "/kernels/build/cargo"
     os.environ["CARGO_TARGET_DIR"] = "/kernels/build/cargo/target"
@@ -107,203 +110,181 @@ def sync_workspace(src: str = "./sglang"):
     subprocess.run(["modal", "volume", "put", "workspace", src], check=True)
     print("Done. You can now run build_kernels_workspace or workspace_ls.")
 
-@app.function(image=image, gpu=None, volumes={"/workspace": workspace})
-def workspace_ls(path: str = "/workspace/sglang") -> list:
-    """List files under the synced workspace to verify contents after `modal volume put workspace ./sglang`."""
-    import os
-    result = []
-    for root, dirs, files in os.walk(path):
-        for name in files:
-            p = os.path.join(root, name)
-            try:
-                sz = os.path.getsize(p)
-            except Exception:
-                sz = -1
-            result.append({"path": p, "size": sz})
-    return result
 
 
-@app.function(image=image, gpu=None)
-def tool_versions() -> dict:
-    """Report versions of key toolchain components inside the image."""
-    import subprocess, shlex
-    checks = {
-        "nvcc": "nvcc --version",
-        "nsys": "nsys --version",
-        "ncu": "ncu --version",
-        "rustc": "rustc --version",
-        "cargo": "cargo --version",
-        "cmake": "cmake --version",
-        "ninja": "ninja --version",
-        "uv": "python3 -m uv --version",
-    }
-    out = {}
-    for name, cmd in checks.items():
-        try:
-            proc = subprocess.run(shlex.split(cmd), check=False, capture_output=True, text=True)
-            if proc.returncode == 0:
-                out[name] = proc.stdout.strip() or proc.stderr.strip()
-            else:
-                out[name] = f"exit={proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}"
-        except Exception as e:
-            out[name] = f"error: {e}"
-    return out
+# --- helpers: put near the top of app.py (after imports) ---
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/kernels": kc, "/logs": log, "/workspace": workspace}, timeout=30*60)
-def build_source() -> str:
-    """Prebuild using code synced into /workspace/sglang (from 'workspace' volume)."""
-    # Set caches and env BEFORE installs so builds use the /kernels volume
-    set_build_vars()
+def _detect_sm() -> str:
+    """
+    Best-effort: read compute capability from nvidia-smi.
+    Fallback to 8.9 (L4) if not available.
+    """
+    import subprocess, re
+    try:
+        out = subprocess.check_output(
+            ["bash", "-lc", "nvidia-smi -q -d COMPUTE || true"],
+            text=True, stderr=subprocess.STDOUT
+        )
+        m = re.search(r"Compute\s+Capability\s*:\s*([0-9]+)\.([0-9]+)", out)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+    except Exception:
+        pass
+    return "8.9"
 
-    log_path = f"/logs/sglang/build_ws_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.log"
-    # Easy fix: make CMake 4.0 accept older project policy floors (e.g., dlpack)
-    os.environ["CMAKE_ARGS"] = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+def _arch_lists(sm_csv: str | None) -> tuple[str, str]:
+    """
+    sm_csv: semicolon-joined list like '7.5;8.0;8.6;8.9;9.0'
+    Returns (TORCH_CUDA_ARCH_LIST, FLASHINFER_CUDA_ARCH_LIST)
+    """
+    sm_csv = sm_csv or _detect_sm()
+    items = [x.strip() for x in sm_csv.split(";") if x.strip()]
+    torch_list = ";".join(items)
+    flashinfer_list = ";".join(f"{int(float(x)*10)}" for x in items)  # 8.9 -> 89
+    return torch_list, flashinfer_list
+
+
+
+# --- UPDATED: build_source() ---
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    volumes={"/hf": hf, "/kernels": kc, "/logs": log, "/workspace": workspace},
+    timeout=30 * 60,
+)
+def build_source(
+    sm_targets: str = "",     # e.g. "7.5;8.0;8.6;8.9;9.0" (empty => auto-detect single SM)
+    multi_sm: bool = False    # if True and sm_targets empty, use a multi-SM default
+) -> str:
+    """
+    Build sglang runtime + sgl-kernel + flashinfer-python into a persistent /kernels mount.
+    uv's cache is redirected to /tmp/uvcache to avoid volume permission issues.
+    """
+    import os, shlex, subprocess
+    from datetime import datetime
+
+    # --- decide SMs ---
+    if not sm_targets:
+        sm_targets = "7.5;8.0;8.6;8.9;9.0" if multi_sm else _detect_sm()
+    TORCH_CUDA_ARCH_LIST, FLASHINFER_CUDA_ARCH_LIST = _arch_lists(sm_targets)
+
+    # --- persistent + temp caches ---
+    os.makedirs("/kernels/torch_extensions", exist_ok=True)
+    os.makedirs("/kernels/wheels", exist_ok=True)
+    os.makedirs("/tmp/uvcache", exist_ok=True)
+    os.makedirs("/tmp/pipcache", exist_ok=True)
+    os.makedirs("/tmp/xdgcache", exist_ok=True)
+
+    # try to avoid sticky perms from host
+    try:
+        subprocess.run(["bash", "-lc", "chmod -R 777 /kernels || true"], check=False)
+    except Exception:
+        pass
+
+    # --- environment for builds ---
     env = {**os.environ}
+    env.update({
+        # make nvcc & CUDA headers/libs discoverable
+        "CUDA_HOME": "/usr/local/cuda/targets/x86_64-linux",
+        "CUDA_TOOLKIT_ROOT_DIR": "/usr/local/cuda/targets/x86_64-linux",
+        "CUDA_NVCC_EXECUTABLE": "/usr/local/cuda/bin/nvcc",
+        "PATH": f"/usr/local/cuda/bin:{env.get('PATH','')}",
 
-    def run_and_tee(cmd: list[str]) -> int:
+        # where compiled extensions (.so/.cubin) go (PERSISTENT)
+        "TORCH_EXTENSIONS_DIR": "/kernels/torch_extensions",
+        "TORCH_CUDA_ARCH_LIST": TORCH_CUDA_ARCH_LIST,
+        "FLASHINFER_CUDA_ARCH_LIST": FLASHINFER_CUDA_ARCH_LIST,
+
+        # uv/pip caches (TEMP; local FS to avoid 'Operation not permitted')
+        "UV_CACHE_DIR": "/tmp/uvcache",
+        "PIP_CACHE_DIR": "/tmp/pipcache",
+        "XDG_CACHE_HOME": "/tmp/xdgcache",
+
+        # build speed/compat and verbosity (cap parallelism to reduce OOM risk)
+        "MAX_JOBS": "2",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+        "USE_NINJA": "1",
+        "VERBOSE": "1",
+        "NINJA_STATUS": "[%f/%t @%r | %es]",
+        "CMAKE_ARGS": (
+            f"-DCMAKE_POLICY_VERSION_MINIMUM=3.5 "
+            f"-DNO_CUDA_VERSION_CHECK=ON -DIGNORE_CUDA_VERSION_CHECK=ON "
+            f"-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc "
+            f"-DCMAKE_CUDA_ARCHITECTURES={FLASHINFER_CUDA_ARCH_LIST} "
+            f"-DCMAKE_VERBOSE_MAKEFILE=ON "
+            f"-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE "
+            f"-DCMAKE_CUDA_FLAGS=\"-Xptxas -v -lineinfo\" "
+            f"-Wno-dev"
+        ),
+    })
+
+    # legacy symlinks some scripts expect
+    subprocess.run(
+        ["bash", "-lc",
+         "set -e;"
+         "if [ ! -e /usr/local/cuda/include ]; then ln -s targets/x86_64-linux/include /usr/local/cuda/include; fi; "
+         "if [ ! -e /usr/local/cuda/lib64 ]; then ln -s targets/x86_64-linux/lib /usr/local/cuda/lib64; fi; "
+        ],
+        env=env, check=False
+    )
+
+    # --- logging ---
+    log_path = f"/logs/sglang/build_ws_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.log"
+    def tee(cmd: list[str]) -> int:
         with open(log_path, "a", buffering=1) as f:
-            f.write("$ " + " ".join(cmd) + "\n")
+            f.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            for line in proc.stdout or []:
+            assert proc.stdout is not None
+            for line in proc.stdout:
                 print(line, end=""); f.write(line)
             return proc.wait()
 
-    # Debugging: Print environment, permissions, and filesystem info before installs
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: user / python / cwd ===' && whoami && id && pwd && python3 -V"])  
-    run_and_tee(["python3", "-c", "import os,sys; print('sys.executable=', sys.executable); print('UV_CACHE_DIR=', os.environ.get('UV_CACHE_DIR')); print('PIP_CACHE_DIR=', os.environ.get('PIP_CACHE_DIR')); print('CCACHE_DIR=', os.environ.get('CCACHE_DIR')); print('CARGO_HOME=', os.environ.get('CARGO_HOME')); print('CARGO_TARGET_DIR=', os.environ.get('CARGO_TARGET_DIR')); print('XDG_CACHE_HOME=', os.environ.get('XDG_CACHE_HOME')); print('UV_LINK_MODE=', os.environ.get('UV_LINK_MODE'));"])
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: selected env ===' && env | sort | egrep '^(UV|PIP|CC|CARGO|XDG|TORCH|TRITON|CUDA|SGLANG|HF|TOKENIZERS)' || true"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: filesystem types ===' && df -Th | sed -n '1p;/\\/kernels/p;/\\/workspace/p;/\\/tmp/p'"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: dirs / perms ===' && ls -ld /kernels /kernels/build /kernels/build/uv /kernels/build/pip /kernels/build/ccache /kernels/build/cargo /kernels/build/cargo/target || true"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: stat details ===' && for d in /kernels /kernels/build /kernels/build/*; do stat -c '%A %U:%G %n' \"$d\"; done || true"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: write tests (kernels caches) ===' && set -e; for d in /kernels/build/uv /kernels/build/pip /kernels/build/ccache /kernels/build/cargo /kernels/build/cargo/target; do touch \"$d/.write_test\" && echo OK > \"$d/.write_test\" && ls -l \"$d/.write_test\"; done; true"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: root uv cache dir (should be unused) ===' && ls -ld /root/.cache /root/.cache/uv || true"])  
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: uv version ===' && python3 -m uv --version"])  
-    # Small uv cache write test with a tiny package
-    run_and_tee(["bash", "-lc", "echo '=== DEBUG: uv cache write test (packaging==24.2) ===' && python3 -m uv pip install --reinstall --no-deps packaging==24.2"])  
+    # --- diagnostics ---
+    tee(["bash", "-lc", "echo '=== DEBUG: build env ==='; env | egrep '^(CUDA|TORCH|FLASHINFER|UV|PIP|XDG|CMAKE|PATH)=' | sort"])
+    tee(["bash", "-lc", f"echo '=== DEBUG: archs ==='; echo TORCH_CUDA_ARCH_LIST={shlex.quote(TORCH_CUDA_ARCH_LIST)}; echo FLASHINFER_CUDA_ARCH_LIST={shlex.quote(FLASHINFER_CUDA_ARCH_LIST)}; echo CMAKE_CUDA_ARCHITECTURES={shlex.quote(FLASHINFER_CUDA_ARCH_LIST)}"])
+    tee(["bash", "-lc", "echo '=== DEBUG: volumes ==='; df -Th | sed -n '1p;/\\/kernels/p;/\\/workspace/p;/\\/tmp/p'"])
+    tee(["bash", "-lc", "echo '=== DEBUG: torch_extensions ==='; ls -lah /kernels/torch_extensions || true"])
 
-    # Build/install editable packages from the synced workspace
     code = 0
-    code |= run_and_tee(["python3", "-m", "uv", "pip", "install", "-e", "/workspace/sglang/python[runtime_common]"]) or 0
-    code |= run_and_tee(["python3", "-m", "uv", "pip", "install", "--no-build-isolation", "-e", "/workspace/sglang/sgl-kernel"]) or 0
-    code |= run_and_tee(["python3", "-m", "uv", "pip", "install", "--no-build-isolation", "-e", "/workspace/sglang/sgl-router"]) or 0
 
-    kc.commit(); log.commit(); 
-    return f"{log_path} (exit={code})"
+    # --- 1) sglang runtime (editable) ---
+    # keep uv cache on /tmp; compile-time artifacts land in TORCH_EXTENSIONS_DIR
+    code |= tee([
+        "python3", "-m", "uv", "pip", "install", "-v",
+        "--cache-dir", "/tmp/uvcache",
+        "-e", "/workspace/sglang/python[runtime_common]",
+    ]) or 0
 
-@app.function(image=image, gpu=GPU, volumes={"/hf": hf, "/logs": log, "/workspace": workspace})
-def inference_test(prompt: str = "Say hi in 5 words.", model_id: str = MODEL_ID, max_new_tokens: int = 64, attention_backend: str = "") -> dict:
-    import os, time
-    # Install sglang from the synced workspace
-    subprocess.run(["python3", "-m", "pip", "install", "-e", "/workspace/sglang/python"], check=True)
-    subprocess.run(["python3", "-m", "pip", "install", "-e", "/workspace/sglang/sgl-kernel"], check=False)
-    subprocess.run(["python3", "-m", "pip", "install", "-e", "/workspace/sglang/sgl-router"], check=False)
-    import sglang as sgl
-    if attention_backend:
-        os.environ["SGLANG_ATTENTION_BACKEND"] = attention_backend
-    t0 = time.time()
-    eng = sgl.Engine(model_path=model_id)
-    t1 = time.time()
-    out = eng.generate([prompt], {"max_new_tokens": max_new_tokens, "temperature": 0.0})
-    t2 = time.time()
-    eng.shutdown()
-    result = {"timestamp": datetime.utcnow().isoformat() + "Z",
-              "model_id": model_id,
-              "prompt": prompt,
-              "completion": out[0]["text"],
-              "load_time_sec": t1-t0,
-              "gen_time_sec": t2-t1,
-              "gen_tokens": max_new_tokens,
-              "backend": os.environ.get("SGLANG_ATTENTION_BACKEND", "")}
-    with open(f"/logs/sglang/inference_ws_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json", "w") as f:
-        json.dump(result, f)
-    return result
+    # --- 2) sgl-kernel (force source build) ---
+    code |= tee([
+        "python3", "-m", "uv", "pip", "install", "-v",
+        "--cache-dir", "/tmp/uvcache",
+        "--no-build-isolation",
+        "--no-binary", "sgl-kernel",
+        "-e", "/workspace/sglang/sgl-kernel",
+    ]) or 0
 
+    # --- 3) flashinfer-python (force source build, pinned) ---
+    code |= tee([
+        "python3", "-m", "uv", "pip", "install", "-v",
+        "--cache-dir", "/tmp/uvcache",
+        "--no-build-isolation",
+        "--no-binary", "flashinfer-python",
+        "flashinfer-python==0.3.0",
+    ]) or 0
 
-@app.function(image=image, gpu=None, volumes={"/kernels": kc})
-def test_cache() -> dict:
-    """Smoke-test that compiler caches write to /kernels (prints to console only).
+    # (wheel-building step removed on request)
 
-    Steps:
-    1) Set build env (ccache + CMake launchers)
-    2) Zero ccache stats; record config
-    3) Build a tiny C project twice with CMake+Ninja so the 2nd build yields ccache hits
-    4) Summarize stats and confirm files exist under /kernels/build/ccache
-    """
-    # 1) Build env
-    set_build_vars()
-
-    # Local helpers
-    env = {**os.environ}
-
-    def run(cmd: list[str]) -> tuple[int, str]:
-        print("$ " + " ".join(cmd))
-        proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="")
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode, out
-
-    # 2) Inspect env and ccache config; zero stats
-    cc_dir = os.environ.get("CCACHE_DIR", "")
-    run(["bash", "-lc", "echo CCACHE_DIR=$CCACHE_DIR; echo CMAKE_C_COMPILER_LAUNCHER=$CMAKE_C_COMPILER_LAUNCHER; echo CMAKE_CUDA_COMPILER_LAUNCHER=$CMAKE_CUDA_COMPILER_LAUNCHER"])
-    run(["bash", "-lc", "ls -ld /kernels /kernels/build /kernels/build/ccache || true"]) 
-    run(["ccache", "-z"])  # zero stats
-    _, cc_cfg = run(["ccache", "--show-config"])
-    _, stats0 = run(["ccache", "-s"])  # before
-
-    # 3) Tiny C project built twice
-    work = "/tmp/ccache_smoke"
+    # persist volumes
     try:
-        shutil.rmtree(work, ignore_errors=True)
-        os.makedirs(work, exist_ok=True)
-        with open(os.path.join(work, "CMakeLists.txt"), "w") as f:
-            f.write(
-                "\n".join([
-                    "cmake_minimum_required(VERSION 3.22)",
-                    "project(ccache_smoke LANGUAGES C)",
-                    "set(CMAKE_VERBOSE_MAKEFILE ON)",
-                    "add_executable(hello main.c)",
-                ])
-            )
-        with open(os.path.join(work, "main.c"), "w") as f:
-            f.write('#include <stdio.h>\nint main(){ puts("hi"); return 0; }\n')
-
-        build1 = os.path.join(work, "build1")
-        build2 = os.path.join(work, "build2")
-        for bdir in (build1, build2):
-            os.makedirs(bdir, exist_ok=True)
-
-        # First build (expect cache miss)
-        run(["cmake", "-S", work, "-B", build1, "-G", "Ninja"])
-        run(["cmake", "--build", build1, "-v"])
-        _, stats1 = run(["ccache", "-s"])  # after first build
-
-        # Second build in a fresh build dir (expect cache hits)
-        run(["cmake", "-S", work, "-B", build2, "-G", "Ninja"])
-        run(["cmake", "--build", build2, "-v"])
-        _, stats2 = run(["ccache", "-s"])  # after second build
-    finally:
-        # leave the build dirs; they are temporary, but keeping them is fine
+        kc.commit()
+    except Exception:
+        pass
+    try:
+        log.commit()
+    except Exception:
         pass
 
-    # 4) Summarize filesystem evidence under /kernels
-    cache_file_count = 0
-    sample = []
-    for root, _, files in os.walk(cc_dir or "/kernels/build/ccache"):
-        for name in files:
-            cache_file_count += 1
-            if len(sample) < 10:
-                sample.append(os.path.join(root, name))
-
-    result = {
-        "ccache_dir": cc_dir,
-        "ccache_config": cc_cfg,
-        "stats_before": stats0,
-        "stats_after_first": stats1,
-        "stats_after_second": stats2,
-        "cache_file_count": cache_file_count,
-        "cache_file_sample": sample,
-    }
-    return result
+    return f"{log_path} (exit={code})"
